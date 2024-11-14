@@ -1,0 +1,36 @@
+name: Deploy to Self-hosted Runner
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Create deployment directory
+        run: |
+          DEPLOY_DIR="deploy"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          DEPLOY_PATH="$DEPLOY_DIR/$TIMESTAMP"
+
+          # Create deployment directory
+          mkdir -p "$DEPLOY_PATH"
+
+          # Copy all files except .git directory
+          rsync -av --exclude='.git' ./ "$DEPLOY_PATH/"
+
+          # Create/Update symbolic link to latest deployment
+          ln -sfn "$DEPLOY_PATH" "$DEPLOY_DIR/latest"
+
+          # Optional: Keep only last 5 deployments
+          cd "$DEPLOY_DIR" && ls -t | tail -n +6 | xargs rm -rf
+
+          echo "Deployed to: $DEPLOY_PATH"
+          echo "Latest symbolic link updated: $DEPLOY_DIR/latest"
