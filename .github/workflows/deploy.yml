@@ -23,8 +23,7 @@ jobs:
 
       - name: Create .env file
         run: |
-          echo "GROQ_API_KEY=${{ secrets.secrets.GROQ_API_KEY }}" > .env
-          echo "PORT=${{ secrets.secrets.PORT }}" >> .env
+          echo "GROQ_API_KEY=${{ secrets.secrets}}" > .env
 
       - name: Sync code to application directory
         run: |
@@ -34,6 +33,7 @@ jobs:
             --exclude '.gitignore' \
             --exclude 'README.md' \
             --exclude '.github' \
+            --exclude 'logs' \
             ./ /home/muhammedr7025/server
 
       - name: Install dependencies in app directory
