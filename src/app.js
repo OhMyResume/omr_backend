@@ -12,6 +12,10 @@ const wss = new WebSocket.Server({ server });
 app.use(cors());
 app.use(express.json());
 
+app.get("/v1/status", (req, res) => {
+  res.json({ status: "ok" });
+});
+
 setupWebSocket(wss);
 
 server.listen(config.port, () => {
