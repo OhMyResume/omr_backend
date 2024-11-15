@@ -21,23 +21,24 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Create .env file
+        run: |
+          echo "GROQ_API_KEY=${{ secrets.secrets.GROQ_API_KEY }}" > .env
+          echo "PORT=${{ secrets.secrets.PORT }}" >> .env
+
       - name: Sync code to application directory
         run: |
           rsync -avz --delete \
             --exclude 'node_modules' \
             --exclude '.git' \
+            --exclude '.gitignore' \
+            --exclude 'README.md' \
             --exclude '.github' \
             ./ /home/muhammedr7025/server
 
       - name: Install dependencies in app directory
         working-directory: /home/muhammedr7025/server
         run: npm ci
-
-      - name: Install PM2 globally if not present
-        run: |
-          if ! command -v pm2 &> /dev/null; then
-            npm install pm2 -g
-          fi
 
       - name: Restart PM2 process
         working-directory: /home/muhammedr7025/server
