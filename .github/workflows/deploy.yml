@@ -1,9 +1,10 @@
-name: Deploy to Self-hosted Runner
+name: Deploy CI/CD Pipeline
 
 on:
   push:
     branches: [main]
-  workflow_dispatch:
+  pull_request:
+    branches: [main]
 
 jobs:
   deploy:
@@ -11,26 +12,36 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
         with:
-          fetch-depth: 1
+          node-version: "18.x"
 
-      - name: Create deployment directory
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Sync code to application directory
         run: |
-          DEPLOY_DIR="deploy"
-          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          DEPLOY_PATH="$DEPLOY_DIR/$TIMESTAMP"
+          rsync -avz --delete \
+            --exclude 'node_modules' \
+            --exclude '.git' \
+            --exclude '.github' \
+            ./ /home/muhammedr7025/server
 
-          # Create deployment directory
-          mkdir -p "$DEPLOY_PATH"
+      - name: Install dependencies in app directory
+        working-directory: /home/muhammedr7025/server
+        run: npm ci
 
-          # Copy all files except .git directory
-          rsync -av --exclude='.git' ./ "$DEPLOY_PATH/"
+      - name: Install PM2 globally if not present
+        run: |
+          if ! command -v pm2 &> /dev/null; then
+            npm install pm2 -g
+          fi
 
-          # Create/Update symbolic link to latest deployment
-          ln -sfn "$DEPLOY_PATH" "$DEPLOY_DIR/latest"
-
-          # Optional: Keep only last 5 deployments
-          cd "$DEPLOY_DIR" && ls -t | tail -n +6 | xargs rm -rf
-
-          echo "Deployed to: $DEPLOY_PATH"
-          echo "Latest symbolic link updated: $DEPLOY_DIR/latest"
+      - name: Restart PM2 process
+        working-directory: /home/muhammedr7025/server
+        run: pm2 restart ecosystem.config.js --env production
