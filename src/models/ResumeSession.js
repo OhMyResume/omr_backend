@@ -14,9 +14,7 @@ class ResumeSession {
   }
 
   async start() {
-    setTimeout(() => {
-      this.sendQuestion(questionSequence[0]);
-    }, 3000);
+    this.sendQuestion(questionSequence[0]);
   }
 
   sendQuestion(questionData) {
@@ -27,7 +25,7 @@ class ResumeSession {
     };
     setTimeout(() => {
       this.ws.send(JSON.stringify(message));
-    }, 3000);
+    }, 1000);
   }
 
   updateResumeField(field, value) {
@@ -58,8 +56,8 @@ class ResumeSession {
     ]`;
 
     const completion = await groq.chat.completions.create({
-      messages: [{ role: "user", content: prompt }],
-      model: "mixtral-8x7b-32768",
+      messages: [{ role: "assistant", content: prompt }],
+      model: "gemma2-9b-it",
       temperature: 0.3,
       max_tokens: 1024,
     });
@@ -83,8 +81,8 @@ class ResumeSession {
     ]`;
 
     const completion = await groq.chat.completions.create({
-      messages: [{ role: "user", content: prompt }],
-      model: "mixtral-8x7b-32768",
+      messages: [{ role: "assistant", content: prompt }],
+      model: "gemma2-9b-it",
       temperature: 0.3,
       max_tokens: 1024,
     });
@@ -101,8 +99,8 @@ class ResumeSession {
     ["JavaScript", "React", "Node.js", "Project Management"]`;
 
     const completion = await groq.chat.completions.create({
-      messages: [{ role: "user", content: prompt }],
-      model: "mixtral-8x7b-32768",
+      messages: [{ role: "assistant", content: prompt }],
+      model: "gemma2-9b-it",
       temperature: 0.3,
       max_tokens: 1024,
     });
@@ -120,8 +118,8 @@ class ResumeSession {
     ["AWS Certified Solutions Architect", "PMP Certification"]`;
 
     const completion = await groq.chat.completions.create({
-      messages: [{ role: "user", content: prompt }],
-      model: "mixtral-8x7b-32768",
+      messages: [{ role: "assistant", content: prompt }],
+      model: "gemma2-9b-it",
       temperature: 0.3,
       max_tokens: 1024,
     });
@@ -134,7 +132,8 @@ class ResumeSession {
       case "personalInfo.name":
         prompt = `Extract only the person's name from this text. If no name is found, respond with "NO_NAME_FOUND". 
                  only extract the name, not the rest of the text 
-                 respond with the name only
+                 respond with the name only in camel case
+                 no double quotes and no json
                  Example: "hi my name is John Doe" -> "John Doe"
                  Text: "${answer}"`;
         break;
@@ -154,14 +153,16 @@ class ResumeSession {
         prompt = `Extract only the job title from this text. Fix any typos. If no title is found, respond with "NO_TITLE_FOUND".
                  Example: "I work as a Senior Software Engineer" -> "Senior Software Engineer"
                  only extract the title, not the rest of the text
-                 if text is directly a job title, respond with that title
+                 if text is directly a job title, respond with that only title in camel case
+                 no double quotes and no json 
                  Text: "${answer}"`;
+
         break;
     }
 
     const completion = await groq.chat.completions.create({
-      messages: [{ role: "user", content: prompt }],
-      model: "llama3-8b-8192",
+      messages: [{ role: "assistant", content: prompt }],
+      model: "gemma2-9b-it",
       max_tokens: 100,
     });
 
@@ -190,13 +191,13 @@ class ResumeSession {
   Generate a concise, professional summary emphasizing the candidate's experience, skills, and career goals.
   Start the response directly with the summary content without any introductory phrases or additional explanations.
   Limit the summary to 3 sentences.
-  Input:
-  "${answer}"`;
-
+  Text: "${answer}"
+ `;
     const completion = await groq.chat.completions.create({
-      messages: [{ role: "user", content: prompt }],
-      model: "llama3-8b-8192",
+      messages: [{ role: "assistant", content: prompt }],
+      model: "gemma2-9b-it",
       max_tokens: 100,
+      temperature: 0.3,
     });
 
     const result = completion.choices[0].message.content.trim();
@@ -271,7 +272,7 @@ class ResumeSession {
               },
             })
           );
-        }, 3000);
+        }, 2000);
 
         // If it's the first question and we got a NO_NAME_FOUND, ask again
         if (
