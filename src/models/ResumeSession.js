@@ -1,6 +1,9 @@
 const Groq = require("groq-sdk");
 const config = require("../config/config");
+const sessionStore = require("../utils/sessionStore");
 const { resumeTemplate, questionSequence } = require("../utils/templates");
+const { v4: uuidv4 } = require("uuid");
+const WebSocket = require("ws");
 
 const groq = new Groq({
   apiKey: config.groqApiKey,
@@ -9,26 +12,86 @@ const groq = new Groq({
 class ResumeSession {
   constructor(ws) {
     this.ws = ws;
+    this.sessionId = null;
     this.currentQuestionIndex = 0;
     this.resume = { ...resumeTemplate };
+    this.hasStarted = false;
   }
 
-  async start() {
-    this.sendQuestion(questionSequence[0]);
+  async initialize(existingSessionId = null) {
+    if (existingSessionId) {
+      const existingSession = await sessionStore.getSession(existingSessionId);
+
+      if (existingSession) {
+        console.log("Resuming existing session:", existingSessionId);
+        this.sessionId = existingSessionId;
+        this.currentQuestionIndex = existingSession.currentQuestionIndex || 0;
+        this.resume = existingSession.resume;
+        return true; // Return true if session was restored
+      }
+    }
+
+    // Initialize a new session if no existing session is found
+    console.log("Initializing new session...");
+    this.sessionId = uuidv4();
+    this.currentQuestionIndex = 0;
+    await this.saveSession();
+    return false; // Return false if new session was created
+  }
+
+  async saveSession() {
+    await sessionStore.updateSession(this.sessionId, {
+      currentQuestionIndex: this.currentQuestionIndex,
+      resume: this.resume,
+      lastActive: Date.now(),
+    });
+  }
+
+  async start(sessionId = null) {
+    if (this.hasStarted) {
+      return; // Prevent multiple starts
+    }
+
+    const sessionRestored = await this.initialize(sessionId);
+
+    // Only send the first question if:
+    // 1. This is a new session (currentQuestionIndex === 0) OR
+    // 2. This is a restored session but we haven't completed all questions
+    if (
+      !sessionRestored ||
+      (this.currentQuestionIndex > 0 &&
+        this.currentQuestionIndex < questionSequence.length)
+    ) {
+      const nextQuestion = questionSequence[this.currentQuestionIndex];
+      console.log(
+        `Sending question ${this.currentQuestionIndex}:`,
+        nextQuestion
+      );
+      this.sendQuestion(nextQuestion);
+    }
+
+    this.hasStarted = true;
   }
 
   sendQuestion(questionData) {
     const message = {
       type: "question",
-      data: questionData,
+      data: {
+        ...questionData,
+        sessionId: this.sessionId,
+      },
       currentResume: this.resume,
     };
+
+    // Add a small delay to prevent race conditions
     setTimeout(() => {
-      this.ws.send(JSON.stringify(message));
-    }, 1000);
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify(message));
+      }
+    }, 100);
   }
 
-  updateResumeField(field, value) {
+  async updateResumeField(field, value) {
     const fieldPath = field.split(".");
     let current = this.resume;
     for (let i = 0; i < fieldPath.length - 1; i++) {
@@ -38,304 +101,319 @@ class ResumeSession {
       current = current[fieldPath[i]];
     }
     current[fieldPath[fieldPath.length - 1]] = value;
+    await this.saveSession();
   }
+
   async processExperience(answer) {
     const prompt = `
-    Extract work experience information from this text and format it as a JSON array of experiences.
-    Each experience should have: title, company, period, and achievements (as an array).
-    Text: "${answer}"
-    
-    Respond only with the JSON array. Example format:
-    [
-      {
-        "title": "Senior Developer",
-        "company": "Tech Corp",
-        "period": "2020-2023",
-        "achievements": ["Led team of 5 developers", "Increased performance by 40%"]
+      Extract experience details from text and format as JSON array. Text must contain job title, company, period, and achievements.
+      Input: "${answer}"
+      Required format:
+      [
+        {
+          "title": "Job Title",
+          "company": "Company Name", 
+          "period": "YYYY-YYYY",
+          "achievements": ["Achievement 1", "Achievement 2"]
+        }
+      ]
+      
+      Use exact text from input when possible. Split achievements into separate array items.`;
+
+    try {
+      const completion = await groq.chat.completions.create({
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a parser that converts job experience text into structured JSON. Only output valid JSON.",
+          },
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        model: "gemma2-9b-it",
+        temperature: 0.1,
+        max_tokens: 1024,
+      });
+
+      const result = completion.choices[0].message.content;
+      // Validate JSON structure
+      const parsed = JSON.parse(result);
+      if (
+        !Array.isArray(parsed) ||
+        !parsed[0]?.title ||
+        !parsed[0]?.company ||
+        !parsed[0]?.period ||
+        !Array.isArray(parsed[0]?.achievements)
+      ) {
+        throw new Error("Invalid experience format");
       }
-    ]`;
-
-    const completion = await groq.chat.completions.create({
-      messages: [{ role: "assistant", content: prompt }],
-      model: "gemma2-9b-it",
-      temperature: 0.3,
-      max_tokens: 1024,
-    });
-
-    return JSON.parse(completion.choices[0].message.content);
+      return parsed;
+    } catch (error) {
+      throw new Error(
+        "Please provide your role, company name, work period, and key achievements."
+      );
+    }
   }
 
   async processEducation(answer) {
     const prompt = `
-    Extract education information from this text and format it as a JSON array.
-    Each education entry should have: degree, school, and period.
-    Text: "${answer}"
-    
-    Respond only with the JSON array. Example format:
-    [
-      {
-        "degree": "Bachelor of Science in Computer Science",
-        "school": "University of Technology",
-        "period": "2016-2020"
+      Convert education text to JSON array, fixing spelling and formatting:
+      Input: "${answer}"
+      Required output format:
+      [
+        {
+          "degree": "Name of Degree in Computer Science/IT",
+          "school": "Full School Name",
+          "period": "YYYY-YYYY"
+        }
+      ]
+      Rules:
+      - Fix common typos (e.g. "ploytchnic" -> "Polytechnic")
+      - Format school name properly
+      - Use standard degree names (e.g. "Computer Science" not "coputerscince")
+      - Extract or infer period if given`;
+
+    try {
+      const completion = await groq.chat.completions.create({
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a parser that converts education details into structured JSON, fixing any typos or formatting issues.",
+          },
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        model: "gemma2-9b-it",
+        temperature: 0.1,
+        max_tokens: 1024,
+      });
+
+      const result = completion.choices[0].message.content;
+      const parsed = JSON.parse(result);
+
+      // Validate structure
+      if (
+        !Array.isArray(parsed) ||
+        !parsed[0]?.degree ||
+        !parsed[0]?.school ||
+        !parsed[0]?.period
+      ) {
+        throw new Error("Invalid education format");
       }
-    ]`;
 
-    const completion = await groq.chat.completions.create({
-      messages: [{ role: "assistant", content: prompt }],
-      model: "gemma2-9b-it",
-      temperature: 0.3,
-      max_tokens: 1024,
-    });
-
-    return JSON.parse(completion.choices[0].message.content);
+      return parsed;
+    } catch (error) {
+      throw new Error(
+        "Please provide your school, degree and study period in a clear format."
+      );
+    }
   }
 
   async processSkills(answer) {
     const prompt = `
-    Extract professional skills from this text and return them as a JSON array of strings.
-    Text: "${answer}"
-    
-    Respond only with the JSON array. Example:
-    ["JavaScript", "React", "Node.js", "Project Management"]`;
+    Convert text to JSON array of professional skills:
+    Input: "${answer}"
+    Rules:
+    - Extract only technical/professional skills
+    - Return as JSON array of strings
+    - Normalize skill names
+    - Limit to most relevant skills
+    Format: ["Skill1", "Skill2", ...]`;
 
-    const completion = await groq.chat.completions.create({
-      messages: [{ role: "assistant", content: prompt }],
-      model: "gemma2-9b-it",
-      temperature: 0.3,
-      max_tokens: 1024,
-    });
+    try {
+      const completion = await groq.chat.completions.create({
+        messages: [{ role: "assistant", content: prompt }],
+        model: "gemma2-9b-it",
+        temperature: 0.3,
+        max_tokens: 1024,
+      });
 
-    return JSON.parse(completion.choices[0].message.content);
+      return JSON.parse(completion.choices[0].message.content);
+    } catch (error) {
+      throw new Error("Please list your key professional skills.");
+    }
   }
 
   async processCertifications(answer) {
     const prompt = `
-    Extract certifications from this text and return them as a JSON array of strings.
-    If no certifications are mentioned, return an empty array.
-    Text: "${answer}"
-    
-    Respond only with the JSON array. Example:
-    ["AWS Certified Solutions Architect", "PMP Certification"]`;
+    Convert certification information to JSON array:
+    Input: "${answer}"
+    Rules:
+    - Extract only formal certifications
+    - Return as JSON array of strings
+    - Include certification provider if mentioned
+    - Return empty array if no certifications found
+    Format: ["Certification1", "Certification2", ...]`;
 
-    const completion = await groq.chat.completions.create({
-      messages: [{ role: "assistant", content: prompt }],
-      model: "gemma2-9b-it",
-      temperature: 0.3,
-      max_tokens: 1024,
-    });
+    try {
+      const completion = await groq.chat.completions.create({
+        messages: [{ role: "assistant", content: prompt }],
+        model: "gemma2-9b-it",
+        temperature: 0.3,
+        max_tokens: 1024,
+      });
 
-    return JSON.parse(completion.choices[0].message.content);
-  }
-  async processPersonalInfo(field, answer) {
-    let prompt;
-    switch (field) {
-      case "personalInfo.name":
-        prompt = `Extract only the person's name from this text. If no name is found, respond with "NO_NAME_FOUND". 
-                 only extract the name, not the rest of the text 
-                 respond with the name only in camel case
-                 no double quotes and no json
-                 Example: "hi my name is John Doe" -> "John Doe"
-                 Text: "${answer}"`;
-        break;
-      // case "personalInfo.email":
-      //   prompt = `Extract only the email address from this text. If no email is found, respond with "NO_EMAIL_FOUND".
-      //            Example: "my email is john@example.com" -> "john@example.com"
-      //            if text is directly an email address, respond with that address
-      //            Text: "${answer}"`;
-      //   break;
-      // case "personalInfo.phone":
-      //   prompt = `Extract only the phone number from this text. If no phone number is found, respond with "NO_PHONE_FOUND".
-      //            Example: "my number is 1234567890" -> "1234567890"
-      //            if text is directly a phone number, respond with that number
-      //            Text: "${answer}"`;
-      //   break;
-      case "personalInfo.title":
-        prompt = `Extract only the job title from this text. Fix any typos. If no title is found, respond with "NO_TITLE_FOUND".
-                 Example: "I work as a Senior Software Engineer" -> "Senior Software Engineer"
-                 only extract the title, not the rest of the text
-                 if text is directly a job title, respond with that only title in camel case
-                 no double quotes and no json 
-                 Text: "${answer}"`;
-
-        break;
+      return JSON.parse(completion.choices[0].message.content);
+    } catch (error) {
+      return []; // Return empty array if no certifications
     }
+  }
 
-    const completion = await groq.chat.completions.create({
-      messages: [{ role: "assistant", content: prompt }],
-      model: "gemma2-9b-it",
-      max_tokens: 100,
-    });
+  async processPersonalInfo(field, answer) {
+    const prompts = {
+      "personalInfo.name": `
+        Extract full name from: "${answer}"
+        Rules:
+        - Return only the name without any prefixes
+        - Return as plain text, not JSON
+        - If no name found, return "Unknown"`,
 
-    const result = completion.choices[0].message.content.trim();
+      "personalInfo.title": `
+        Extract job title from: "${answer}"
+        Rules:
+        - Return single professional title
+        - Return as plain text without any prefixes
+        - If no title found, return "Professional"`,
+    };
 
-    // Handle cases where no valid data was found
-    if (result.includes("NO_") && result.includes("_FOUND")) {
+    try {
+      const completion = await groq.chat.completions.create({
+        messages: [{ role: "assistant", content: prompts[field] }],
+        model: "gemma2-9b-it",
+        temperature: 0.1,
+        max_tokens: 100,
+      });
+
+      const result = completion.choices[0].message.content
+        .trim()
+        .replace(/^(Answer:|Solution:)\s*/i, ""); // Remove "Answer:" prefix
+
+      if (result === "Unknown" || result === "Professional") {
+        throw new Error(`Please provide your ${field.split(".")[1]}.`);
+      }
+      return result;
+    } catch (error) {
       throw new Error(
-        `Could not find valid ${
-          field.split(".")[1]
-        } in your response. Please try again.`
+        `Could not process ${field.split(".")[1]}. Please try again.`
       );
     }
-
-    return result;
   }
 
   async processSummary(answer) {
-    if (answer.toLowerCase() === "hello" || answer.length < 10) {
-      throw new Error(
-        "Please provide more details about your professional background so I can create a meaningful summary."
-      );
-    }
-
     const prompt = `
-  Generate a concise, professional summary emphasizing the candidate's experience, skills, and career goals.
-  Start the response directly with the summary content without any introductory phrases or additional explanations.
-  Limit the summary to 3 sentences.
-  Text: "${answer}"
- `;
-    const completion = await groq.chat.completions.create({
-      messages: [{ role: "assistant", content: prompt }],
-      model: "gemma2-9b-it",
-      max_tokens: 100,
-      temperature: 0.3,
-    });
-
-    const result = completion.choices[0].message.content.trim();
-
-    if (result === "NO_SUMMARY_FOUND") {
-      throw new Error(
-        "Please provide more details about your professional background so I can create a meaningful summary."
-      );
-    }
-
-    return result;
-  }
-  async processAnswer(answer) {
-    const currentQuestion = questionSequence[this.currentQuestionIndex];
-    console.log("Processing answer for question:", currentQuestion.id);
-    console.log("Answer received:", answer);
+    Create professional summary from:
+    "${answer}"
+    Rules:
+    - 2-3 sentences maximum
+    - Include years of experience if mentioned
+    - Focus on key skills and achievements
+    - Make it achievement-oriented
+    - Return as plain text, not JSON`;
 
     try {
-      let processedValue;
+      const completion = await groq.chat.completions.create({
+        messages: [{ role: "assistant", content: prompt }],
+        model: "gemma2-9b-it",
+        temperature: 0.3,
+        max_tokens: 200,
+      });
 
-      // Add input validation
-      if (!answer || answer.trim().length === 0) {
-        throw new Error("Please provide a response.");
-      }
-
-      // Process the answer based on the field type
-      try {
-        switch (currentQuestion.field) {
-          case "experience":
-            processedValue = await this.processExperience(answer);
-            break;
-          case "education":
-            processedValue = await this.processEducation(answer);
-            break;
-          case "skills":
-            processedValue = await this.processSkills(answer);
-            break;
-          case "certifications":
-            processedValue = await this.processCertifications(answer);
-            break;
-          case "summary":
-            processedValue = await this.processSummary(answer);
-            break;
-          default:
-            if (currentQuestion.field.startsWith("personalInfo.")) {
-              processedValue = await this.processPersonalInfo(
-                currentQuestion.field,
-                answer
-              );
-            }
-        }
-
-        // Validate processed value
-        if (!processedValue) {
-          throw new Error(
-            "Could not process your response. Please try again with more details."
-          );
-        }
-
-        // Update resume with processed value
-        this.updateResumeField(currentQuestion.field, processedValue);
-
-        // Send update to client
-        setTimeout(() => {
-          this.ws.send(
-            JSON.stringify({
-              type: "update",
-              data: {
-                field: currentQuestion.field,
-                value: processedValue,
-                currentResume: this.resume,
-              },
-            })
-          );
-        }, 2000);
-
-        // If it's the first question and we got a NO_NAME_FOUND, ask again
-        if (
-          currentQuestion.id === "name" &&
-          processedValue === "NO_NAME_FOUND"
-        ) {
-          this.ws.send(
-            JSON.stringify({
-              type: "question",
-              data: {
-                ...currentQuestion,
-                question:
-                  "I didn't catch your name. Could you please tell me your full name?",
-              },
-            })
-          );
-          return;
-        }
-
-        // Move to next question
-        this.currentQuestionIndex++;
-        if (this.currentQuestionIndex < questionSequence.length) {
-          this.sendQuestion(questionSequence[this.currentQuestionIndex]);
-        } else {
-          // Resume is complete
-          console.log("Resume complete:", this.resume);
-          this.ws.send(
-            JSON.stringify({
-              type: "complete",
-              data: {
-                message:
-                  "Great! Your resume is complete. Feel free to review and make any adjustments needed.",
-                finalResume: this.resume,
-              },
-            })
-          );
-        }
-      } catch (processingError) {
-        // Send error message and ask the same question again
-        this.ws.send(
-          JSON.stringify({
-            type: "error",
-            data: {
-              message: processingError.message,
-            },
-          })
+      const result = completion.choices[0].message.content.trim();
+      if (result.length < 50) {
+        throw new Error(
+          "Please provide more details about your professional background."
         );
-        // Ask the same question again
-        this.sendQuestion(currentQuestion);
       }
+      return result;
     } catch (error) {
-      console.error("Error in processAnswer:", error);
+      throw new Error("Please provide a more detailed professional summary.");
+    }
+  }
+
+  async processField(field, answer) {
+    switch (field) {
+      case "experience":
+        return await this.processExperience(answer);
+      case "education":
+        return await this.processEducation(answer);
+      case "skills":
+        return await this.processSkills(answer);
+      case "certifications":
+        return await this.processCertifications(answer);
+      case "personalInfo.name":
+      case "personalInfo.title":
+        return await this.processPersonalInfo(field, answer);
+      case "summary":
+        return await this.processSummary(answer);
+      default:
+        return answer;
+    }
+  }
+
+  async processAnswer(answer) {
+    try {
+      const currentQuestion = questionSequence[this.currentQuestionIndex];
+      let processedValue = await this.processField(
+        currentQuestion.field,
+        answer
+      );
+      await this.updateResumeField(currentQuestion.field, processedValue);
+
       this.ws.send(
         JSON.stringify({
-          type: "error",
+          type: "update",
           data: {
-            message:
-              error.message || "Sorry, something went wrong. Please try again.",
+            field: currentQuestion.field,
+            value: processedValue,
+            currentResume: this.resume,
+            sessionId: this.sessionId,
           },
         })
       );
-      // Ask the same question again
-      this.sendQuestion(currentQuestion);
+
+      this.currentQuestionIndex++;
+      await this.saveSession();
+
+      if (this.currentQuestionIndex < questionSequence.length) {
+        this.sendQuestion(questionSequence[this.currentQuestionIndex]);
+      } else {
+        this.ws.send(
+          JSON.stringify({
+            type: "complete",
+            data: {
+              message: "Your resume is complete",
+              finalResume: this.resume,
+              sessionId: this.sessionId,
+            },
+          })
+        );
+      }
+    } catch (error) {
+      this.handleError(error);
+    }
+  }
+
+  handleError(error) {
+    console.error("Error during session:", error);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(
+        JSON.stringify({
+          type: "error",
+          data: { message: error.message || "An error occurred" },
+        })
+      );
+    }
+  }
+
+  async cleanup() {
+    if (this.sessionId) {
+      await sessionStore.deleteSession(this.sessionId);
     }
   }
 }
